@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""rice-settings - small Tk GUI for the rice dotfiles. Talks to the `rice` CLI."""
+import json, subprocess, tkinter as tk
+from tkinter import ttk
+
+
+def rice(*a):
+    return subprocess.run(["rice", *a], capture_output=True, text=True).stdout
+
+
+def load_state():
+    return json.loads(rice("dump"))
+
+
+S = load_state()
+C = json.loads(rice("colors"))
+THEMES = rice("list", "themes").split()
+ANIMS = rice("list", "anims").split()
+BGS = rice("list", "bgs").split()
+MODULES = rice("list", "modules").split()
+FONTS = sorted({f.split(",")[0].strip() for f in
+                subprocess.run(["fc-list", ":", "family"], capture_output=True, text=True).stdout.splitlines() if f.strip()})
+
+root = tk.Tk()
+root.title("Rice settings")
+root.configure(bg=C["bg"])
+root.option_add("*TCombobox*Listbox.background", C["bg_alt"])
+root.option_add("*TCombobox*Listbox.foreground", C["fg"])
+root.option_add("*TCombobox*Listbox.selectBackground", C["accent"])
+root.option_add("*TCombobox*Listbox.selectForeground", C["on_accent"])
+st = ttk.Style(root)
+st.theme_use("clam")
+st.configure(".", background=C["bg"], foreground=C["fg"], fieldbackground=C["bg_alt"],
+             bordercolor=C["border"], lightcolor=C["bg"], darkcolor=C["bg"], troughcolor=C["bg_alt"])
+# Inputs: explicit field + text colors in EVERY state (the "clam" style otherwise paints readonly
+# comboboxes and focused fields white, which made light text on them unreadable).
+FIELD, TXT = C["bg_alt"], C["fg"]
+for w in ("TEntry", "TSpinbox", "TCombobox"):
+    st.configure(w, fieldbackground=FIELD, background=FIELD, foreground=TXT, insertcolor=TXT,
+                 arrowcolor=TXT, bordercolor=C["border"], lightcolor=FIELD, darkcolor=FIELD,
+                 selectbackground=C["accent"], selectforeground=C["on_accent"])
+    st.map(w, fieldbackground=[("readonly", FIELD), ("disabled", FIELD), ("focus", FIELD), ("active", FIELD)],
+           background=[("readonly", FIELD), ("active", C["surface"])],
+           foreground=[("readonly", TXT), ("disabled", C["fg_dim"]), ("focus", TXT)],
+           selectbackground=[("readonly", FIELD), ("focus", C["accent"])],
+           selectforeground=[("readonly", TXT), ("focus", C["on_accent"])],
+           bordercolor=[("focus", C["accent"])])
+st.configure("TCheckbutton", background=C["bg"], foreground=TXT, indicatorbackground=FIELD,
+             indicatorforeground=TXT, indicatormargin=4)
+st.map("TCheckbutton", background=[("active", C["bg"])], indicatorbackground=[("selected", C["accent"]), ("active", C["surface"])],
+       indicatorforeground=[("selected", C["on_accent"])])
+st.configure("TLabel", background=C["bg"], foreground=TXT)
+st.configure("TFrame", background=C["bg"])
+st.configure("TButton", background=C["accent"], foreground=C["on_accent"], padding=6)
+st.map("TButton", background=[("active", C["accent_alt"])])
+st.configure("TNotebook", background=C["bg"])
+st.configure("TNotebook.Tab", background=C["bg_alt"], foreground=C["fg_dim"], padding=(12, 6))
+st.map("TNotebook.Tab", background=[("selected", C["accent"])], foreground=[("selected", C["on_accent"])])
+
+nb = ttk.Notebook(root)
+nb.pack(fill="both", expand=True, padx=10, pady=10)
+V = {}
+
+
+def page(title):
+    f = ttk.Frame(nb, padding=10)
+    nb.add(f, text=title)
+    f.columnconfigure(1, weight=1)
+    return f
+
+
+def row(f, label, key, kind, values=None, lo=0, hi=100, step=1):
+    r = f.grid_size()[1]
+    ttk.Label(f, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=4)
+    if kind == "choice":
+        v = tk.StringVar(value=str(S[key]))
+        w = ttk.Combobox(f, textvariable=v, values=values, state="readonly", width=32)
+    elif kind in ("int", "float"):
+        v = tk.StringVar(value=str(S[key]))
+        w = ttk.Spinbox(f, textvariable=v, from_=lo, to=hi, increment=step, width=10)
+    elif kind == "bool":
+        v = tk.BooleanVar(value=bool(S[key]))
+        w = ttk.Checkbutton(f, variable=v)
+    else:
+        v = tk.StringVar(value=str(S[key]))
+        w = ttk.Entry(f, textvariable=v, width=34)
+    w.grid(row=r, column=1, sticky="w", padx=6, pady=4)
+    V[key] = (kind, v)
+
+
+look = page("Look")
+row(look, "Theme (now)", "theme", "choice", THEMES)
+row(look, "Day theme", "day_theme", "choice", THEMES)
+row(look, "Night theme", "night_theme", "choice", THEMES)
+row(look, "Auto day/night", "auto_daynight", "bool")
+row(look, "Day starts (hour)", "day_start", "int", lo=0, hi=23)
+row(look, "Night starts (hour)", "night_start", "int", lo=0, hi=23)
+row(look, "Animations", "animation", "choice", ANIMS)
+row(look, "Main background", "background_main", "choice", BGS)
+row(look, "Window opacity", "opacity_active", "float", lo=0.5, hi=1, step=0.05)
+row(look, "Inactive opacity", "opacity_inactive", "float", lo=0.5, hi=1, step=0.05)
+row(look, "Blur (costs battery)", "blur", "bool")
+row(look, "Shadows (costs battery)", "shadow", "bool")
+
+eye = page("Eyecare")
+row(eye, "Eyecare mode on", "eyecare", "bool")
+row(eye, "Warmth (kelvin, lower = warmer)", "eyecare_temp", "int", lo=2000, hi=6500, step=100)
+row(eye, "Use schedule instead", "eyecare_schedule", "bool")
+row(eye, "Schedule: starts at hour", "eyecare_start", "int", lo=0, hi=23)
+row(eye, "Schedule: ends at hour", "eyecare_end", "int", lo=0, hi=23)
+ttk.Label(eye, text="6500 = neutral | 4500 mild | 4000 default | 3500 strong | 3000 very warm | 2500 candle",
+          foreground=C["fg_dim"]).grid(row=eye.grid_size()[1], column=0, columnspan=2, sticky="w", padx=6, pady=10)
+
+fonts = page("Fonts")
+row(fonts, "UI font", "font_ui", "choice", FONTS)
+row(fonts, "Monospace font", "font_mono", "choice", FONTS)
+row(fonts, "Pixel font", "font_pixel", "choice", FONTS)
+row(fonts, "Font size", "font_size", "int", lo=8, hi=20)
+row(fonts, "Terminal uses", "terminal_font", "choice", ["mono", "pixel", "ui"])
+row(fonts, "Bar uses", "bar_font", "choice", ["mono", "pixel", "ui"])
+row(fonts, "ASCII background uses", "bg_font", "choice", ["mono", "pixel", "ui"])
+
+art = page("Background art")
+bsel = tk.StringVar(value=S["background_current"])
+BO = {}
+ttk.Label(art, text="Background").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+ttk.Combobox(art, textvariable=bsel, values=BGS, state="readonly", width=32).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+BOPTS = [("Fit (cover = fill whole screen)", "fit", "choice", ["contain", "cover"]),
+         ("Size when 'contain' (% of screen)", "scale", "num", (20, 100, 5)),
+         ("Softness (0 crisp, 2 soft, 4+ smooth)", "soften", "num", (0, 10, 0.5)),
+         ("Edge fade (% , fades art into background)", "feather", "num", (0, 50, 1)),
+         ("Ink strength (0-1)", "strength", "num", (0, 1, 0.05))]
+for i, (lab, key, kind, spec) in enumerate(BOPTS, start=1):
+    ttk.Label(art, text=lab).grid(row=i, column=0, sticky="w", padx=6, pady=4)
+    v = tk.StringVar()
+    if kind == "choice":
+        ttk.Combobox(art, textvariable=v, values=spec, state="readonly", width=12).grid(row=i, column=1, sticky="w", padx=6)
+    else:
+        ttk.Spinbox(art, textvariable=v, from_=spec[0], to=spec[1], increment=spec[2], width=10).grid(row=i, column=1, sticky="w", padx=6)
+    BO[key] = (kind, v)
+
+
+def bg_load(*_):
+    info = json.loads(rice("bg", "info", bsel.get()) or "{}")
+    for k, (_, v) in BO.items():
+        v.set(str(info.get(k, "")))
+
+
+def bg_apply():
+    opts = {}
+    for k, (kind, v) in BO.items():
+        x = v.get()
+        opts[k] = x if kind == "choice" else float(x)
+    rice("bg", "opts", bsel.get(), json.dumps(opts))
+    rice("bg", "set", bsel.get())
+    status.set("Background art updated.")
+
+
+ttk.Button(art, text="Apply to this background", command=bg_apply).grid(row=len(BOPTS) + 1, column=1, sticky="w", padx=6, pady=10)
+bsel.trace_add("write", bg_load)
+bg_load()
+
+lay = page("Layout")
+row(lay, "Inner gaps", "gap_in", "int", lo=0, hi=30)
+row(lay, "Outer gaps", "gap_out", "int", lo=0, hi=60)
+row(lay, "Border size", "border_size", "int", lo=0, hi=8)
+row(lay, "Corner rounding", "rounding", "int", lo=0, hi=30)
+row(lay, "Bar opacity", "bar_opacity", "float", lo=0, hi=1, step=0.05)
+row(lay, "Bar position", "bar_position", "choice", ["top", "bottom"])
+
+barp = page("Bar modules")
+BV = {}
+cur = {m: next((sd for sd in ("left", "center", "right") if m in S["bar"].get(sd, [])), "off") for m in MODULES}
+for i, m in enumerate(MODULES):
+    ttk.Label(barp, text=m).grid(row=i, column=0, sticky="w", padx=6, pady=3)
+    v = tk.StringVar(value=cur[m])
+    ttk.Combobox(barp, textvariable=v, values=["left", "center", "right", "off"], state="readonly", width=10).grid(row=i, column=1, sticky="w", padx=6)
+    BV[m] = v
+
+apps = page("Apps")
+row(apps, "Extra Obsidian vault (optional)", "obsidian_vault", "text")
+row(apps, "Auto-apply Spotify (spicetify)", "spicetify_auto", "bool")
+
+
+def collect():
+    out = {}
+    for k, (kind, v) in V.items():
+        x = v.get()
+        out[k] = int(float(x)) if kind == "int" else float(x) if kind == "float" else bool(x) if kind == "bool" else x
+    bar = {}
+    for side in ("left", "center", "right"):
+        chosen = [m for m in MODULES if BV[m].get() == side]
+        keep = [m for m in S["bar"].get(side, []) if m in chosen]
+        bar[side] = keep + [m for m in chosen if m not in keep]
+    out["bar"] = bar
+    return out
+
+
+def apply_all():
+    global S
+    status.set("Applying...")
+    root.update_idletasks()
+    rice("set-many", json.dumps(collect()))
+    S = load_state()
+    status.set("Applied.")
+
+
+def toggle():
+    rice("toggle")
+    V["theme"][1].set(load_state()["theme"])
+    status.set("Toggled day/night.")
+
+
+bar_ = ttk.Frame(root)
+bar_.pack(fill="x", padx=10, pady=(0, 10))
+ttk.Button(bar_, text="Apply", command=apply_all).pack(side="left", padx=4)
+ttk.Button(bar_, text="Day / Night", command=toggle).pack(side="left", padx=4)
+def setup_apps():
+    import os
+    log = os.path.expanduser("~/.cache/rice/setup.log")
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    subprocess.Popen(["sh", "-c", f"rice setup > '{log}' 2>&1"])
+    status.set("Setting up apps... see ~/.cache/rice/setup.log")
+
+
+ttk.Button(bar_, text="Set up apps", command=setup_apps).pack(side="left", padx=4)
+ttk.Button(bar_, text="Refresh apps only", command=lambda: (rice("apply", "apps"), status.set("Apps refreshed."))).pack(side="left", padx=4)
+ttk.Button(bar_, text="Next background", command=lambda: rice("bg", "next")).pack(side="left", padx=4)
+ttk.Button(bar_, text="Close", command=root.destroy).pack(side="right", padx=4)
+status = tk.StringVar(value="")
+ttk.Label(bar_, textvariable=status).pack(side="left", padx=12)
+root.mainloop()

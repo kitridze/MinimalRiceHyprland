@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Rice {{theme_name}}",
+  "version": "1.0",
+  "theme": {
+    "colors": {
+      "frame": [{{bg_alt.rgb}}],
+      "frame_inactive": [{{bg_alt.rgb}}],
+      "toolbar": [{{bg.rgb}}],
+      "tab_text": [{{fg.rgb}}],
+      "tab_background_text": [{{fg_dim.rgb}}],
+      "bookmark_text": [{{fg.rgb}}],
+      "ntp_background": [{{bg.rgb}}],
+      "ntp_text": [{{fg.rgb}}],
+      "ntp_link": [{{accent.rgb}}],
+      "button_background": [{{bg.rgb}}]
+    }
+  }
+}

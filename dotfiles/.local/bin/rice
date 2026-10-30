@@ -1,0 +1,837 @@
+#!/usr/bin/env python3
+"""rice - theme / animation / background / bar manager for the Hyprland dotfiles.
+
+Usage: rice help
+"""
+import json, os, random, re, shutil, subprocess, sys, time, tomllib
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+CFG = HOME / ".config/rice"
+CACHE = HOME / ".cache/rice"
+SETTINGS = CFG / "rice.json"
+NULL = subprocess.DEVNULL
+
+DEFAULTS = {
+    "theme": "sakura", "day_theme": "sakura", "night_theme": "lavender-night",
+    "auto_daynight": False, "day_start": 7, "night_start": 19, "auto_phase": "",
+    "animation": "smooth",
+    "font_ui": "Inter", "font_mono": "JetBrainsMono Nerd Font", "font_pixel": "Monocraft",
+    "font_size": 11, "terminal_font": "mono", "bar_font": "mono", "bg_font": "mono",
+    "gap_in": 4, "gap_out": 8, "border_size": 2, "rounding": 10,
+    "opacity_active": 1.0, "opacity_inactive": 0.95, "bar_opacity": 0.85,
+    "blur": False, "blur_size": 6, "shadow": False,
+    "bar_position": "top",
+    "bar": {
+        "left": ["hyprland/workspaces", "hyprland/window"],
+        "center": ["clock"],
+        "right": ["hyprland/language", "cpu", "memory", "temperature", "network", "wireplumber", "battery"],
+    },
+    "background_main": "cat", "background_current": "cat",
+    "obsidian_vault": "", "spicetify_auto": True,
+    "eyecare": False, "eyecare_temp": 4000,
+    "eyecare_schedule": False, "eyecare_start": 20, "eyecare_end": 7,
+    "vscode_settings": ["~/.config/Code - OSS/User/settings.json", "~/.config/Code/User/settings.json"],
+    "chromium_policy_dir": "/etc/chromium/policies/managed",
+}
+
+REQUIRED = ["mode", "bg", "bg_alt", "surface", "fg", "fg_dim", "accent", "accent_alt",
+            "border", "red", "green", "yellow", "blue", "on_accent"]
+
+# (target name, template file in ~/.config/rice/templates, destination)
+TARGETS = [
+    ("hypr", "hypr-theme.conf", "~/.config/hypr/generated/theme.conf"),
+    ("waybar", "waybar.css", "~/.config/waybar/style.css"),
+    ("foot", "foot.ini", "~/.config/foot/foot.ini"),
+    ("fuzzel", "fuzzel.ini", "~/.config/fuzzel/fuzzel.ini"),
+    ("mako", "mako.conf", "~/.config/mako/config"),
+    ("hyprlock", "hyprlock.conf", "~/.config/hypr/hyprlock.conf"),
+    ("spotify", "spicetify.ini", "~/.config/spicetify/Themes/rice/color.ini"),
+    ("chromium", "chromium.json", "~/.config/rice/chromium-theme/manifest.json"),
+    ("kde", "kdeglobals", "~/.config/kdeglobals"),
+    ("kde", "kdeglobals", "~/.local/share/color-schemes/Rice.colors"),
+    ("mpv", "mpv.conf", "~/.config/mpv/mpv.conf"),
+]
+# Targets for partial updates:  rice apply apps   |   rice apply vscode obsidian   |   rice theme black apps
+GROUPS = {
+    "apps": ["spotify", "chromium", "vscode", "obsidian", "kde", "mpv", "gtk"],
+    "desktop": ["hypr", "waybar", "foot", "fuzzel", "mako", "hyprlock", "bg", "eyecare"],
+}
+ALL_TARGETS = [x for g in GROUPS.values() for x in g]
+
+MODULES = {
+    "hyprland/workspaces": {"format": "{icon}", "format-icons": {"active": "●", "default": "○", "empty": "·"},
+                            "persistent-workspaces": {"*": 4}},
+    "hyprland/window": {"max-length": 40, "separate-outputs": True},
+    "clock": {"format": "{:%H:%M}", "format-alt": "{:%a %d %b  %H:%M}", "tooltip-format": "{:%A, %d %B %Y}"},
+    "cpu": {"format": "CPU {usage}%", "interval": 5},
+    "memory": {"format": "RAM {percentage}%", "interval": 10},
+    "temperature": {"format": "{temperatureC}°C", "interval": 10, "critical-threshold": 85},
+    "battery": {"states": {"warning": 25, "critical": 12}, "interval": 20,
+                "format": "BAT {capacity}%", "format-charging": "CHG {capacity}%",
+                "format-plugged": "AC {capacity}%", "format-full": "FULL",
+                "tooltip-format": "{timeTo}\n{power:.1f} W"},
+    "network": {"format-wifi": "{essid} {signalStrength}%", "format-ethernet": "ETH",
+                "format-disconnected": "offline", "tooltip-format": "{ifname}  {ipaddr}",
+                "on-click": "foot -e nmtui", "interval": 10},
+    "hyprland/language": {"format": "{short}", "on-click": "hyprctl switchxkblayout all next"},
+    "wireplumber": {"format": "VOL {volume}%", "format-muted": "MUTE",
+                    "on-click": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"},
+    "backlight": {"format": "LUM {percent}%"},
+    "tray": {"spacing": 8},
+}
+
+
+# ---------------------------------------------------------------- helpers
+def sh(*a, bg=False):
+    try:
+        if bg:
+            subprocess.Popen(a, stdout=NULL, stderr=NULL, start_new_session=True)
+        else:
+            subprocess.run(a, stdout=NULL, stderr=NULL, timeout=30)
+    except Exception:
+        pass
+
+
+def note(msg):
+    sh("notify-send", "-t", "1500", "-h", "string:x-canonical-private-synchronous:rice", "rice", msg)
+
+
+def expand(p):
+    return Path(os.path.expanduser(str(p)))
+
+
+def write(dest, text):
+    d = expand(dest)
+    d.parent.mkdir(parents=True, exist_ok=True)
+    d.write_text(text)
+
+
+def load():
+    s = json.loads(json.dumps(DEFAULTS))
+    if SETTINGS.exists():
+        s.update(json.loads(SETTINGS.read_text()))
+    return s
+
+
+def save(s):
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS.write_text(json.dumps(s, indent=2, ensure_ascii=False) + "\n")
+
+
+def list_themes():
+    return sorted(p.stem for p in (CFG / "themes").glob("*.toml"))
+
+
+def list_anims():
+    return sorted(p.stem for p in (CFG / "animations").glob("*.conf"))
+
+
+def list_bgs():
+    return sorted(p.stem for p in (CFG / "backgrounds").glob("*.txt"))
+
+
+def load_theme(name):
+    f = CFG / "themes" / f"{name}.toml"
+    if not f.exists():
+        sys.exit(f"rice: no such theme '{name}' (try: rice list themes)")
+    t = tomllib.loads(f.read_text())
+    missing = [k for k in REQUIRED if k not in t]
+    if missing:
+        sys.exit(f"rice: theme '{name}' is missing keys: {', '.join(missing)}")
+    return t
+
+
+def ctx(s):
+    c = dict(s)
+    c.update(load_theme(s["theme"]))
+    fonts = {"mono": s["font_mono"], "pixel": s["font_pixel"], "ui": s["font_ui"]}
+    c["theme_name"] = s["theme"]
+    c["term_font"] = fonts.get(s["terminal_font"], s["font_mono"])
+    c["bar_font"] = fonts.get(s["bar_font"], s["font_mono"])
+    c["bg_font_family"] = fonts.get(s["bg_font"], s["font_mono"])
+    c["font_size_big"] = int(s["font_size"]) + 2
+    c["icon_theme"] = "breeze-dark" if c["mode"] == "dark" else "breeze"
+    return c
+
+
+PAT = re.compile(r"\{\{\s*(\w+)(?:\.(hex|rgbc|rgb))?\s*\}\}")
+
+
+def render(text, c):
+    def sub(m):
+        k, mod = m.group(1), m.group(2)
+        if k not in c:
+            sys.exit(f"rice: template uses unknown variable '{k}'")
+        v = c[k]
+        if mod == "hex":
+            return str(v).lstrip("#")
+        if mod in ("rgb", "rgbc"):
+            h = str(v).lstrip("#")
+            return ("," if mod == "rgbc" else ", ").join(str(int(h[i:i + 2], 16)) for i in (0, 2, 4))
+        if isinstance(v, bool):
+            return str(v).lower()
+        return str(v)
+    return PAT.sub(sub, text)
+
+
+def tpl(name, c):
+    return render((CFG / "templates" / name).read_text(), c)
+
+
+# ---------------------------------------------------------------- generators
+def waybar_config(s):
+    b = s["bar"]
+    cfg = {"layer": "top", "position": s["bar_position"], "height": 30, "spacing": 6,
+           "margin": "6 8 0 8" if s["bar_position"] == "top" else "0 8 6 8",
+           "reload_style_on_change": True}
+    for side in ("left", "center", "right"):
+        cfg[f"modules-{side}"] = b.get(side, [])
+        for m in b.get(side, []):
+            if m in MODULES:
+                cfg[m] = MODULES[m]
+    return cfg
+
+
+def load_jsonc(path):
+    """Parse JSON with comments / trailing commas (VS Code settings.json)."""
+    txt = path.read_text()
+    out, i, n, in_str = [], 0, len(txt), False
+    while i < n:
+        ch = txt[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(txt[i + 1])
+                i += 1
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+        elif txt.startswith("//", i):
+            while i < n and txt[i] != "\n":
+                i += 1
+            continue
+        elif txt.startswith("/*", i):
+            k = txt.find("*/", i + 2)
+            i = n if k < 0 else k + 1
+        else:
+            out.append(ch)
+        i += 1
+    s = re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+    return json.loads(s) if s.strip() else {}
+
+
+def vscode(c, s):
+    """Live theming: writes colorCustomizations into VS Code's settings.json (VS Code applies it instantly)."""
+    th = json.loads(tpl("vscode.json", c))
+    dark = c["mode"] == "dark"
+    font = f"'{s['font_mono']}', monospace"
+    for p in map(expand, s["vscode_settings"]):
+        if not p.parent.parent.exists():
+            continue
+        try:
+            cur = load_jsonc(p) if p.exists() else {}
+        except Exception as e:
+            print(f"rice: could not parse {p} ({e}); left untouched", file=sys.stderr)
+            continue
+        new = dict(cur)
+        new["workbench.colorTheme"] = "Default Dark Modern" if dark else "Default Light Modern"
+        new["window.autoDetectColorScheme"] = False
+        new["workbench.colorCustomizations"] = th["colors"]
+        new["editor.tokenColorCustomizations"] = {"textMateRules": th["tokenColors"]}
+        new["editor.fontFamily"] = font
+        new["terminal.integrated.fontFamily"] = font
+        if new == cur and p.exists():
+            continue
+        p.parent.mkdir(parents=True, exist_ok=True)
+        bak = p.with_name(p.name + ".rice-backup")
+        if p.exists() and not bak.exists():
+            bak.write_text(p.read_text())
+        p.write_text(json.dumps(new, indent=2, ensure_ascii=False) + "\n")
+
+
+def obsidian_vaults(s):
+    vs = []
+    if s["obsidian_vault"]:
+        vs.append(expand(s["obsidian_vault"]))
+    try:
+        data = json.loads((HOME / ".config/obsidian/obsidian.json").read_text())
+        vs += [Path(v["path"]) for v in data.get("vaults", {}).values()]
+    except Exception:
+        pass
+    seen, out = set(), []
+    for v in vs:
+        if v not in seen and (v / ".obsidian").exists():
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def obsidian(c, s):
+    """Writes the snippet into every known vault, enables it, and sets Obsidian's base scheme to match."""
+    css = tpl("obsidian.css", c)
+    for v in obsidian_vaults(s):
+        write(v / ".obsidian/snippets/rice.css", css)
+        ap = v / ".obsidian/appearance.json"
+        try:
+            a = json.loads(ap.read_text()) if ap.exists() else {}
+        except Exception:
+            continue
+        b = dict(a)
+        en = list(b.get("enabledCssSnippets", []))
+        if "rice" not in en:
+            en.append("rice")
+        b["enabledCssSnippets"] = en
+        b["theme"] = "obsidian" if c["mode"] == "dark" else "moonstone"
+        if b != a:
+            ap.write_text(json.dumps(b, indent=2))
+
+
+def chromium(c, s):
+    """Managed-policy theming: Chromium re-reads it live. Needs the one-time setup in `rice setup chromium`."""
+    d = expand(s["chromium_policy_dir"])
+    if not (d.is_dir() and os.access(d, os.W_OK)):
+        return
+    pol = {"BrowserThemeColor": c["accent"], "BrowserColorScheme": 2 if c["mode"] == "dark" else 1}
+    f = d / "rice.json"
+    txt = json.dumps(pol, indent=2) + "\n"
+    if not f.exists() or f.read_text() != txt:
+        f.write_text(txt)
+
+
+# ---------------------------------------------------------------- backgrounds
+def screen_size():
+    env = os.environ.get("RICE_SCREEN", "")
+    if re.fullmatch(r"\d+x\d+", env):
+        return tuple(int(x) for x in env.split("x"))
+    try:
+        out = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=5).stdout
+        m = json.loads(out)[0]
+        return int(m["width"]), int(m["height"])
+    except Exception:
+        return 1920, 1080
+
+
+def mix(a, b, t):
+    pa = [int(a.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+    pb = [int(b.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+    return tuple(round(x * (1 - t) + y * t) for x, y in zip(pa, pb))
+
+
+BG_DEFAULTS = {"fit": "contain", "scale": 60, "soften": 0, "feather": 0, "strength": 0.55}
+RAMP = " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
+
+
+def bg_options(name):
+    """Per-background render options: defaults overridden by backgrounds/NAME.toml."""
+    o = dict(BG_DEFAULTS)
+    f = CFG / "backgrounds" / f"{name}.toml"
+    if f.exists():
+        try:
+            o.update(tomllib.loads(f.read_text()))
+        except Exception:
+            pass
+    return o
+
+
+def render_bg(name, c):
+    """fit = contain: art at `scale`% of the screen.  fit = cover: art stretched to fill the whole screen exactly.
+    soften = softness (0-10): 0 crisp glyphs, ~2 soft edges, 4+ smooth image, feather = fade the art's outer edge into the background (0-50 %),
+    strength = how strongly the ink color shows (0-1)."""
+    import hashlib
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+    o = bg_options(name)
+    w, h = screen_size()
+    fam = c["bg_font_family"]
+    src = CFG / "backgrounds" / f"{name}.txt"
+    key = hashlib.md5(json.dumps(["v3", o, c["bg"], c["accent"], c.get("ascii"), fam, w, h, src.stat().st_mtime_ns]).encode()).hexdigest()[:10]
+    out = CACHE / "bg" / f"{c['theme_name']}-{name}-{key}.png"
+    if out.exists():
+        return out
+    lines = src.read_text().expandtabs(4).rstrip("\n").split("\n")
+    cols, rows = max(len(l) for l in lines), len(lines)
+    path = subprocess.run(["fc-match", "-f", "%{file}", fam], capture_output=True, text=True).stdout.strip()
+    adv = ImageFont.truetype(path, 100).getlength("M") / 100.0
+
+    def font_at(sz):
+        try:
+            return ImageFont.truetype(path, sz)
+        except Exception:
+            return ImageFont.truetype(path, int(round(sz)))
+
+    if o["fit"] == "cover":
+        cw, lh = w / cols, h / rows
+        font = font_at(cw / adv)
+        x0 = y0 = 0.0
+    else:
+        best = 10
+        frac = float(o["scale"]) / 100.0
+        for sz in range(10, 120):
+            if adv * sz * cols > w * frac or sz * 1.2 * rows > h * frac:
+                break
+            best = sz
+        font = font_at(best)
+        cw, lh = adv * best, best * 1.2
+        x0, y0 = (w - cw * cols) / 2, (h - lh * rows) / 2
+    mask = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(mask)
+    for i, line in enumerate(lines):
+        d.text((x0, y0 + i * lh), line, font=font, fill=255)
+    soft = float(o["soften"])
+    if soft > 0:
+        # 1) blend toward a per-character-cell average: removes the row/column "grid" and glyph jaggies
+        cells = mask.resize((cols, rows), Image.BOX).resize((w, h), Image.BICUBIC) if o["fit"] == "cover" else \
+            mask.resize((max(1, round(w / cw)), max(1, round(h / lh))), Image.BOX).resize((w, h), Image.BICUBIC)
+        mask = Image.blend(mask, cells, min(1.0, soft / 4.0))
+        # 2) gentle round blur for soft silhouette edges
+        mask = mask.filter(ImageFilter.GaussianBlur(soft * 0.05 * lh))
+        gain = 1 + soft * 0.15
+        mask = mask.point(lambda v: min(255, int(v * gain)))
+    feather = float(o["feather"])
+    if feather > 0:
+        aw, ah = min(cw * cols, w), min(lh * rows, h)
+        r = feather / 100.0 * min(aw, ah) * 0.5
+        edge = Image.new("L", (w, h), 0)
+        ex0, ey0 = max(x0, 0), max(y0, 0)
+        ImageDraw.Draw(edge).rectangle([ex0 + r, ey0 + r, ex0 + aw - r, ey0 + ah - r], fill=255)
+        mask = ImageChops.multiply(mask, edge.filter(ImageFilter.GaussianBlur(max(r / 2, 1))))
+    ink = c.get("ascii") or "#%02x%02x%02x" % mix(c["bg"], c["accent"], float(o["strength"]))
+    img = Image.composite(Image.new("RGB", (w, h), ink), Image.new("RGB", (w, h), c["bg"]), mask)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out)
+    return out
+
+
+def write_bg_options(name, opts):
+    f = CFG / "backgrounds" / f"{name}.toml"
+    lines = []
+    for k, v in opts.items():
+        lines.append(f"{k} = {json.dumps(v)}")  # json scalars are valid TOML for str/int/float
+    f.write_text("\n".join(lines) + "\n")
+
+
+def cmd_ascii(args):
+    """rice ascii IMAGE [--cols N] [--name NAME] [--invert] [--gamma G]: image -> backgrounds/NAME.txt"""
+    import argparse
+    from PIL import Image, ImageOps
+    ap = argparse.ArgumentParser(prog="rice ascii")
+    ap.add_argument("image")
+    ap.add_argument("--cols", type=int, default=320, help="characters per row; more = sharper (default 320)")
+    ap.add_argument("--name")
+    ap.add_argument("--invert", action="store_true", help="swap which tones become dense characters")
+    ap.add_argument("--gamma", type=float, default=1.0, help="<1 brighter, >1 darker")
+    ap.add_argument("--aspect", type=float, default=0.6, help="glyph width/height of your font (default 0.6)")
+    a = ap.parse_args(args)
+    im = Image.open(a.image).convert("RGBA")
+    rows = max(1, round(a.cols * im.height / im.width * a.aspect))
+    im = im.resize((a.cols, rows), Image.LANCZOS)
+    alpha = im.getchannel("A").load()
+    lum = ImageOps.autocontrast(im.convert("L"), cutoff=1).point(lambda v: int(255 * (v / 255) ** a.gamma))
+    px = lum.load()
+    ramp = RAMP[::-1] if a.invert else RAMP
+    out = []
+    for y in range(rows):
+        out.append("".join(" " if alpha[x, y] < 40 else ramp[min(len(ramp) - 1, px[x, y] * len(ramp) // 256)] for x in range(a.cols)))
+    name = a.name or Path(a.image).stem
+    (CFG / "backgrounds").mkdir(parents=True, exist_ok=True)
+    (CFG / "backgrounds" / f"{name}.txt").write_text("\n".join(out) + "\n")
+    if not (CFG / "backgrounds" / f"{name}.toml").exists():
+        write_bg_options(name, {"fit": "cover", "soften": 2, "feather": 0, "strength": 0.5})
+    print(f"wrote {name}.txt ({a.cols}x{rows}); try: rice bg set {name}")
+
+
+def set_bg(name, s=None, c=None):
+    s = s or load()
+    c = c or ctx(s)
+    old = subprocess.run(["pgrep", "-x", "swaybg"], capture_output=True, text=True).stdout.split()
+    if name and (CFG / "backgrounds" / f"{name}.txt").exists():
+        try:
+            png = render_bg(name, c)
+            sh("swaybg", "-i", str(png), "-m", "fill", "-c", c["bg"], bg=True)
+        except Exception as e:
+            print(f"rice: background render failed ({e}); using solid color", file=sys.stderr)
+            sh("swaybg", "-c", c["bg"], bg=True)
+    else:
+        sh("swaybg", "-c", c["bg"], bg=True)
+    time.sleep(0.4)
+    for pid in old:
+        try:
+            os.kill(int(pid), 15)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- eyecare (warm screen via hyprsunset)
+def eyecare_state(s):
+    """Returns the wanted color temperature in kelvin as a string, or 'off'."""
+    if s["eyecare_schedule"]:
+        h, a, b = datetime.now().hour, int(s["eyecare_start"]), int(s["eyecare_end"])
+        on = (h >= a or h < b) if a > b else (a <= h < b)
+    else:
+        on = bool(s["eyecare"])
+    return str(int(s["eyecare_temp"])) if on else "off"
+
+
+def eyecare_apply(s):
+    want = eyecare_state(s)
+    f = CACHE / "eyecare"
+    pids = subprocess.run(["pgrep", "-x", "hyprsunset"], capture_output=True, text=True).stdout.split()
+    have = f.read_text().strip() if f.exists() else "off"
+    if want == have and bool(pids) == (want != "off"):
+        return
+    if want != "off":
+        sh("hyprsunset", "-t", want, bg=True)
+    time.sleep(0.3)
+    for pid in pids:
+        try:
+            os.kill(int(pid), 15)
+        except Exception:
+            pass
+    CACHE.mkdir(parents=True, exist_ok=True)
+    f.write_text(want)
+
+
+def sibling(name, phase):
+    """blue-pastel-day <-> blue-pastel-night: the same color family in the other phase, if it exists."""
+    m = re.fullmatch(r"(.+)-(day|night)", name)
+    if m and (CFG / "themes" / f"{m.group(1)}-{phase}.toml").exists():
+        return f"{m.group(1)}-{phase}"
+    return None
+
+
+def cycle(items, cur, d):
+    if not items:
+        return None
+    i = (items.index(cur) + d) if cur in items else 0
+    return items[i % len(items)]
+
+
+# ---------------------------------------------------------------- apply
+def resolve(targets):
+    if not targets:
+        return None
+    out = set()
+    for x in targets:
+        if x in GROUPS:
+            out.update(GROUPS[x])
+        elif x in ALL_TARGETS:
+            out.add(x)
+        else:
+            sys.exit(f"rice: unknown target '{x}' (try: rice list targets)")
+    return out
+
+
+def kde_notify():
+    sh("dbus-send", "--session", "--type=signal", "/KGlobalSettings",
+       "org.kde.KGlobalSettings.notifyChange", "int32:0", "int32:0")
+
+
+def apply(s=None, reload=True, only=None):
+    """Regenerate configs. `only` limits it to some targets/groups (see GROUPS)."""
+    s = s or load()
+    c = ctx(s)
+    only = resolve(only)
+    on = lambda n: only is None or n in only
+    for name, t, dest in TARGETS:
+        if not on(name):
+            continue
+        d = expand(dest)
+        if name == "kde" and d.name == "kdeglobals" and d.exists() and not d.with_name("kdeglobals.rice-backup").exists():
+            d.with_name("kdeglobals.rice-backup").write_text(d.read_text())
+        write(dest, tpl(t, c))
+    if on("hypr"):
+        anim = CFG / "animations" / f"{s['animation']}.conf"
+        if not anim.exists():
+            anim = CFG / "animations" / "smooth.conf"
+        write("~/.config/hypr/generated/anim.conf", render(anim.read_text(), c))
+    if on("waybar"):
+        write("~/.config/waybar/config.jsonc", json.dumps(waybar_config(s), indent=2, ensure_ascii=False))
+    if on("vscode"):
+        vscode(c, s)
+    if on("obsidian"):
+        obsidian(c, s)
+    if on("chromium"):
+        chromium(c, s)
+    if on("gtk"):
+        sh("gsettings", "set", "org.gnome.desktop.interface", "color-scheme",
+           "prefer-dark" if c["mode"] == "dark" else "prefer-light")
+        sh("gsettings", "set", "org.gnome.desktop.interface", "gtk-theme",
+           "Adwaita-dark" if c["mode"] == "dark" else "Adwaita")
+    if reload:
+        if on("hypr"):
+            sh("hyprctl", "reload")
+        if on("waybar"):
+            if subprocess.run(["pgrep", "-x", "waybar"], capture_output=True).returncode == 0:
+                sh("pkill", "-SIGUSR2", "waybar")
+            else:
+                sh("waybar", bg=True)
+        if on("mako"):
+            sh("makoctl", "reload")
+        if on("bg"):
+            set_bg(s["background_current"], s, c)
+        if on("eyecare"):
+            eyecare_apply(s)
+        if on("kde"):
+            kde_notify()
+        if on("spotify") and s["spicetify_auto"] and shutil.which("spicetify"):
+            sh("spicetify", "-q", "apply", bg=True)
+
+
+def set_theme(name, s=None, only=None):
+    s = s or load()
+    load_theme(name)
+    s["theme"] = name
+    save(s)
+    apply(s, only=only)
+    note(f"theme: {name}" + (f" ({' '.join(only)} only)" if only else ""))
+
+
+# ---------------------------------------------------------------- commands
+def cmd_bg(args):
+    s = load()
+    bgs = list_bgs()
+    sub = args[0] if args else "restore"
+    cur = s["background_current"]
+    if sub == "restore":
+        set_bg(cur, s)
+        return
+    if sub == "list":
+        print("\n".join(bgs))
+        return
+    if sub == "main":
+        new = s["background_main"]
+    elif sub == "next":
+        new = cycle(bgs, cur, 1)
+    elif sub == "prev":
+        new = cycle(bgs, cur, -1)
+    elif sub == "random":
+        new = random.choice([b for b in bgs if b != cur] or bgs)
+    elif sub == "pin":
+        s["background_main"] = cur
+        save(s)
+        note(f"main background: {cur}")
+        return
+    elif sub == "set" and len(args) > 1:
+        new = args[1]
+    elif sub == "info" and len(args) > 1:
+        print(json.dumps(bg_options(args[1])))
+        return
+    elif sub == "opts" and len(args) > 2:
+        f = CFG / "backgrounds" / f"{args[1]}.toml"
+        cur = tomllib.loads(f.read_text()) if f.exists() else {}
+        cur.update(json.loads(args[2]))
+        write_bg_options(args[1], cur)
+        return
+    elif sub == "opt" and len(args) > 3:
+        name, k, v = args[1], args[2], args[3]
+        cur = {}
+        f = CFG / "backgrounds" / f"{name}.toml"
+        if f.exists():
+            cur = tomllib.loads(f.read_text())
+        try:
+            cur[k] = json.loads(v)
+        except Exception:
+            cur[k] = v
+        write_bg_options(name, cur)
+        if name == s["background_current"]:
+            set_bg(name, s)
+        return
+    else:
+        sys.exit("usage: rice bg [restore|list|main|next|prev|random|pin|set NAME|info NAME|opt NAME KEY VALUE|opts NAME JSON]")
+    s["background_current"] = new
+    save(s)
+    set_bg(new, s)
+    note(f"background: {new}")
+
+
+def cmd_bar(args):
+    s = load()
+    if not args or args[0] == "toggle":
+        sh("pkill", "-SIGUSR1", "waybar")
+        return
+    if args[0] == "move" and len(args) == 3:
+        m, side = args[1], args[2]
+        if m not in MODULES:
+            sys.exit("unknown module; see: rice list modules")
+        for k in s["bar"]:
+            if m in s["bar"][k]:
+                s["bar"][k].remove(m)
+        if side in ("left", "center", "right"):
+            s["bar"][side].append(m)
+        save(s)
+        apply(s)
+        return
+    sys.exit("usage: rice bar [toggle | move MODULE left|center|right|off]")
+
+
+def cmd_set(args):
+    if len(args) != 2:
+        sys.exit("usage: rice set KEY VALUE   (VALUE may be JSON)")
+    s = load()
+    try:
+        v = json.loads(args[1])
+    except Exception:
+        v = args[1]
+    s[args[0]] = v
+    save(s)
+    apply(s)
+
+
+def cmd_setup(args):
+    """One-time (idempotent) app integration. Prints the few sudo commands it cannot run itself."""
+    s = load()
+    what = args[0] if args else "all"
+    want = lambda x: what in ("all", x)
+    if want("portal"):
+        for pkg in ("xdg-desktop-portal-gtk", "gnome-themes-extra"):
+            if shutil.which("pacman") and subprocess.run(["pacman", "-Qq", pkg], capture_output=True).returncode != 0:
+                print(f"[portal]   missing package -> sudo pacman -S {pkg}")
+        print("[portal]   dark/light follows the theme mode via gsettings + the GTK portal")
+    if want("chromium"):
+        d = expand(s["chromium_policy_dir"])
+        if d.is_dir() and os.access(d, os.W_OK):
+            print("[chromium] policy folder ready; colors now follow the theme live")
+        else:
+            print(f"[chromium] one-time, run:  sudo mkdir -p {d} && sudo chown $USER {d}   then: rice setup chromium")
+    if want("kde"):
+        for pkg in ("breeze", "plasma-integration", "kio-extras"):
+            if shutil.which("pacman") and subprocess.run(["pacman", "-Qq", pkg], capture_output=True).returncode != 0:
+                print(f"[dolphin]  missing package -> sudo pacman -S {pkg}")
+        print("[dolphin]  colors/fonts/icons come from ~/.config/kdeglobals (Dolphin, Gwenview, Strawberry, Okular...)")
+    if want("vscode"):
+        found = [str(p) for p in map(expand, s["vscode_settings"]) if p.parent.parent.exists()]
+        print("[vscode]   will write live colors into: " + (", ".join(found) or "(start VS Code once first)"))
+    if want("obsidian"):
+        vs = obsidian_vaults(s)
+        print("[obsidian] vaults: " + (", ".join(map(str, vs)) or "(none found; open a vault in Obsidian once, or: rice set obsidian_vault PATH)"))
+    if want("spotify"):
+        if not shutil.which("spicetify"):
+            print("[spotify]  spicetify missing -> yay -S spicetify-cli spotify")
+        elif Path("/opt/spotify").exists() and not os.access("/opt/spotify", os.W_OK):
+            print("[spotify]  one-time, run:  sudo chmod a+wr /opt/spotify -R   then: rice setup spotify")
+        else:
+            subprocess.run(["spicetify", "config", "current_theme", "rice", "color_scheme", "base"], capture_output=True)
+            r = subprocess.run(["spicetify", "backup", "apply"], capture_output=True, text=True, timeout=300)
+            print("[spotify]  " + ("themed" if r.returncode == 0 else "spicetify said: " + (r.stdout + r.stderr).strip()[-300:] +
+                  "\n           (start Spotify once and log in, then run: rice setup spotify)"))
+    apply(s)
+    print("done: everything above now follows `rice theme`.")
+
+
+def main():
+    a = sys.argv[1:]
+    cmd = a[0] if a else "help"
+    rest = a[1:]
+    s = load()
+    if cmd == "apply":
+        apply(s, only=rest or None)
+    elif cmd == "theme":
+        t = rest[0] if rest else sys.exit("usage: rice theme NAME|next|prev")
+        ts = list_themes()
+        if t == "next":
+            t = cycle(ts, s["theme"], 1)
+        elif t == "prev":
+            t = cycle(ts, s["theme"], -1)
+        set_theme(t, s, only=rest[1:] or None)
+    elif cmd == "toggle":
+        m = re.fullmatch(r"(.+)-(day|night)", s["theme"])
+        if m and sibling(s["theme"], "night" if m.group(2) == "day" else "day"):
+            t = sibling(s["theme"], "night" if m.group(2) == "day" else "day")
+        else:
+            t = s["day_theme"] if s["theme"] == s["night_theme"] else s["night_theme"]
+        set_theme(t, s)
+    elif cmd == "auto":
+        if s["eyecare_schedule"]:
+            eyecare_apply(s)
+        if not s["auto_daynight"]:
+            return
+        h = datetime.now().hour
+        phase = "day" if s["day_start"] <= h < s["night_start"] else "night"
+        if phase != s["auto_phase"]:
+            s["auto_phase"] = phase
+            save(s)
+            set_theme(sibling(s["theme"], phase) or (s["day_theme"] if phase == "day" else s["night_theme"]), s)
+    elif cmd == "anim":
+        n = rest[0] if rest else sys.exit("usage: rice anim NAME|next")
+        if n == "next":
+            n = cycle(list_anims(), s["animation"], 1)
+        if n not in list_anims():
+            sys.exit("no such preset; see: rice list anims")
+        s["animation"] = n
+        save(s)
+        apply(s)
+        note(f"animations: {n}")
+    elif cmd == "eyecare":
+        sub = rest[0] if rest else "status"
+        if sub in ("on", "off"):
+            s["eyecare"] = sub == "on"
+            save(s)
+            eyecare_apply(s)
+            note(f"eyecare: {sub}")
+        elif sub == "temp" and len(rest) > 1:
+            s["eyecare_temp"] = max(2000, min(6500, int(rest[1])))
+            save(s)
+            eyecare_apply(s)
+            note(f"eyecare: {s['eyecare_temp']} K")
+        elif sub == "restore":
+            eyecare_apply(s)
+        else:
+            print(eyecare_state(s))
+    elif cmd == "setup":
+        cmd_setup(rest)
+    elif cmd == "ascii":
+        cmd_ascii(rest)
+    elif cmd == "bg":
+        cmd_bg(rest)
+    elif cmd == "bar":
+        cmd_bar(rest)
+    elif cmd == "set":
+        cmd_set(rest)
+    elif cmd == "set-many":
+        s.update(json.loads(rest[0]))
+        save(s)
+        apply(s)
+    elif cmd == "get":
+        print(s.get(rest[0], ""))
+    elif cmd == "dump":
+        print(json.dumps(s))
+    elif cmd == "colors":
+        print(json.dumps(load_theme(s["theme"])))
+    elif cmd == "list":
+        what = rest[0] if rest else ""
+        items = {"themes": list_themes, "anims": list_anims, "bgs": list_bgs,
+                 "modules": lambda: list(MODULES),
+                 "targets": lambda: list(GROUPS) + ALL_TARGETS}.get(what)
+        print("\n".join(items()) if items else "usage: rice list themes|anims|bgs|modules|targets")
+    elif cmd == "shot":
+        r = subprocess.run(["slurp"], capture_output=True, text=True)
+        if r.returncode == 0:
+            png = subprocess.run(["grim", "-g", r.stdout.strip(), "-"], capture_output=True).stdout
+            pics = HOME / "Pictures"
+            pics.mkdir(exist_ok=True)
+            (pics / time.strftime("shot-%Y%m%d-%H%M%S.png")).write_bytes(png)
+            subprocess.run(["wl-copy", "--type", "image/png"], input=png)
+            note("screenshot copied + saved")
+    else:
+        print(__doc__)
+        print("""Commands:
+  apply [TARGET...]             regenerate configs; TARGET = apps | desktop | vscode | obsidian | chromium | spotify | kde | mpv | ... (rice list targets)
+  setup [portal|chromium|vscode|obsidian|spotify]   one-time app integration
+  theme NAME|next|prev [TARGET...]   switch theme (optionally only for some targets, e.g. `rice theme mint apps`)
+  toggle                        switch day_theme <-> night_theme
+  auto                          time-based day/night (used by autostart loop)
+  anim NAME|next                switch animation preset (rice list anims)
+  bg main|next|prev|random|pin|set NAME|list|restore|info NAME|opt NAME KEY VALUE
+  ascii IMAGE [--cols N] [--name NAME] [--invert]   convert an image to an ASCII background
+  eyecare on|off|temp KELVIN|restore|status   warm screen (hyprsunset), 2000-6500 K
+  bar toggle | bar move MODULE left|center|right|off
+  set KEY VALUE                 change any rice.json setting and apply
+  shot                          region screenshot to clipboard + ~/Pictures
+  list themes|anims|bgs|modules|targets""")
+
+
+if __name__ == "__main__":
+    main()
